@@ -29,6 +29,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <functional>
+#include <unordered_set>
 
 namespace fs = std::filesystem;
 
@@ -45,7 +46,28 @@ struct BackupStats {
 };
 
 // ─────────────────────────────────────────────
-// Thread Pool
+// Thread-safe directory creation cache
+// ─────────────────────────────────────────────
+struct DirCache {
+    // Tracks which destination directories have already been created.
+    // Prevents redundant create_directories() calls when many files
+    // share the same parent folder (e.g. 1000 files → 1 syscall, not 1000).
+    std::unordered_set<std::string> created;
+    std::mutex                      mutex;
+
+    // Creates the directory only if it hasn't been seen before.
+    void ensureExists(const fs::path& dir) {
+        const std::string key = dir.string();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (created.count(key)) return;  // Already created, skip.
+            created.insert(key);
+        }
+        // Call create_directories outside the lock — it's slow on network
+        // drives and we don't want to block other threads while it runs.
+        fs::create_directories(dir);
+    }
+};
 // FIX 1: Queue holds std::function<void()> so any callable can be submitted.
 // ─────────────────────────────────────────────
 class ThreadPool {
@@ -150,12 +172,12 @@ void safePrint(const std::string& msg) {
 }
 
 // ─────────────────────────────────────────────
-// Core copy logic (unchanged, already thread-safe)
+// Core copy logic
 // ─────────────────────────────────────────────
-bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats) {
+bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats, DirCache& dirCache) {
     try {
-        // Ensure the destination folder exists before writing into it.
-        fs::create_directories(dest.parent_path());
+        // Use the cache to avoid redundant filesystem calls for the same directory.
+        dirCache.ensureExists(dest.parent_path());
 
         // Skip the file if it already exists at the destination and hasn't changed.
         // We compare both timestamp and size to avoid unnecessary copies.
@@ -247,6 +269,7 @@ int main(int argc, char* argv[]) {
     fs::create_directories(destPath);
 
     BackupStats stats;
+    DirCache    dirCache;  // Shared across all threads to deduplicate directory creation.
     auto startTime = std::chrono::steady_clock::now();
 
     std::cout << "Using " << numThreads << " threads\n";
@@ -292,8 +315,8 @@ int main(int argc, char* argv[]) {
         for (const auto& task : fileTasks) {
             // Capture src and dst by value so each lambda owns its own copy of the
             // paths — avoids a dangling reference if the loop variable changes.
-            pool.enqueue([src = task.source, dst = task.dest, &stats]() {
-                copyFile(src, dst, stats);
+            pool.enqueue([src = task.source, dst = task.dest, &stats, &dirCache]() {
+                copyFile(src, dst, stats, dirCache);
             });
         }
 
