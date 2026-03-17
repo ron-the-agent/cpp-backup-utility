@@ -36,6 +36,8 @@ namespace fs = std::filesystem;
 // Thread-safe statistics
 // ─────────────────────────────────────────────
 struct BackupStats {
+    // std::atomic ensures concurrent increments from multiple threads
+    // don't race — no mutex needed for these counters.
     std::atomic<size_t> filesCopied{0};
     std::atomic<size_t> filesSkipped{0};
     std::atomic<size_t> errors{0};
@@ -49,6 +51,7 @@ struct BackupStats {
 class ThreadPool {
 public:
     explicit ThreadPool(size_t numThreads) : stop(false), activeTasks(0) {
+        // Spin up N persistent worker threads — they'll sleep until work arrives.
         for (size_t i = 0; i < numThreads; ++i) {
             workers.emplace_back([this] { workerLoop(); });
         }
@@ -57,11 +60,11 @@ public:
     ~ThreadPool() {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
-            stop = true;
+            stop = true;  // Signal all workers to exit once their queue is empty.
         }
-        condition.notify_all();
+        condition.notify_all();  // Wake every sleeping thread so they can see stop=true.
         for (std::thread& worker : workers) {
-            if (worker.joinable()) worker.join();
+            if (worker.joinable()) worker.join();  // Wait for each thread to finish cleanly.
         }
     }
 
@@ -69,14 +72,16 @@ public:
     void enqueue(std::function<void()> task) {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
-            tasks.push(std::move(task));
+            tasks.push(std::move(task));  // move avoids an extra copy of the callable.
         }
-        condition.notify_one();
+        condition.notify_one();  // Wake exactly one sleeping worker to pick it up.
     }
 
-    // Block until the queue is empty and all active tasks have finished.
+    // Block the calling thread until the queue is empty and all active tasks have finished.
     void waitForCompletion() {
         std::unique_lock<std::mutex> lock(queueMutex);
+        // 'done' CV is notified by workers after each task completes.
+        // We re-check both conditions to guard against spurious wakeups.
         done.wait(lock, [this] { return tasks.empty() && activeTasks == 0; });
     }
 
@@ -94,23 +99,26 @@ private:
             std::function<void()> task;
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
+                // Sleep until there's work to do or the pool is shutting down.
                 condition.wait(lock, [this] { return stop || !tasks.empty(); });
+
+                // If stop is set and nothing is left, this thread's job is done.
                 if (stop && tasks.empty()) return;
 
                 task = std::move(tasks.front());
                 tasks.pop();
                 ++activeTasks;
-                // FIX 3: unlock before executing so other threads can
-                //        dequeue their own tasks concurrently.
+                // Lock is released here (end of scope) before task() runs,
+                // so other workers can dequeue their own tasks concurrently.
             }
 
-            task(); // FIX 2: actually run the work
+            task();  // Execute the actual work (e.g. copyFile).
 
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
                 --activeTasks;
             }
-            // Wake waitForCompletion() in case we just finished the last task.
+            // Notify waitForCompletion() in case this was the last in-flight task.
             done.notify_one();
         }
     }
@@ -119,10 +127,12 @@ private:
 // ─────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────
+// Converts a raw byte count into a human-readable string (e.g. 1048576 → "1.00 MB").
 std::string formatBytes(size_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
     int unitIndex = 0;
     double size = static_cast<double>(bytes);
+    // Repeatedly divide by 1024 until the value fits under the next unit.
     while (size >= 1024.0 && unitIndex < 4) {
         size /= 1024.0;
         ++unitIndex;
@@ -132,6 +142,7 @@ std::string formatBytes(size_t bytes) {
     return oss.str();
 }
 
+// printMutex ensures that concurrent threads don't interleave their output lines.
 std::mutex printMutex;
 void safePrint(const std::string& msg) {
     std::lock_guard<std::mutex> lock(printMutex);
@@ -143,8 +154,11 @@ void safePrint(const std::string& msg) {
 // ─────────────────────────────────────────────
 bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats) {
     try {
+        // Ensure the destination folder exists before writing into it.
         fs::create_directories(dest.parent_path());
 
+        // Skip the file if it already exists at the destination and hasn't changed.
+        // We compare both timestamp and size to avoid unnecessary copies.
         if (fs::exists(dest)) {
             auto sourceTime = fs::last_write_time(source);
             auto destTime   = fs::last_write_time(dest);
@@ -161,15 +175,18 @@ bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats) 
         std::ifstream src(source.string(), std::ios::binary);
         std::ofstream dst(dest.string(),   std::ios::binary);
 
-        const size_t       bufferSize = 1024 * 1024; // 1 MB
+        // Use a 1MB buffer instead of byte-by-byte copies — significantly faster
+        // for large files as it reduces the number of system calls made.
+        const size_t       bufferSize = 1024 * 1024;
         std::vector<char>  buffer(bufferSize);
 
         while (src.good()) {
             src.read(buffer.data(), bufferSize);
-            dst.write(buffer.data(), src.gcount());
+            dst.write(buffer.data(), src.gcount());  // gcount() = bytes actually read
         }
 
         dst.close();
+        // Preserve the original file's last-modified timestamp on the copy.
         fs::last_write_time(dest, fs::last_write_time(source));
 
         auto fileSize = fs::file_size(source);
@@ -208,7 +225,7 @@ int main(int argc, char* argv[]) {
     fs::path destPath   = argv[2];
     bool     recursive  = true;
     size_t   numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 4;
+    if (numThreads == 0) numThreads = 4;  // hardware_concurrency() can return 0 if unknown.
 
     for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
@@ -241,13 +258,17 @@ int main(int argc, char* argv[]) {
     if (fs::is_directory(sourcePath)) {
         std::cout << "\nScanning directory...\n";
         if (recursive) {
+            // recursive_directory_iterator walks all subdirectories automatically.
             for (const auto& entry : fs::recursive_directory_iterator(sourcePath)) {
                 if (fs::is_regular_file(entry)) {
+                    // Compute path relative to source so the folder structure
+                    // is mirrored exactly under the destination.
                     fs::path rel = fs::relative(entry.path(), sourcePath);
                     fileTasks.push_back({entry.path(), destPath / rel});
                 }
             }
         } else {
+            // Shallow mode: only files directly inside sourcePath, no subdirectories.
             for (const auto& entry : fs::directory_iterator(sourcePath)) {
                 if (fs::is_regular_file(entry)) {
                     fileTasks.push_back({entry.path(),
@@ -256,25 +277,29 @@ int main(int argc, char* argv[]) {
             }
         }
     } else {
+        // Single file was passed — wrap it in a task directly.
         fileTasks.push_back({sourcePath, destPath / sourcePath.filename()});
     }
 
     std::cout << "Found " << fileTasks.size() << " files to process\n"
               << std::string(50, '-') << "\n";
 
-    // FIX 4 & 5: enqueue lambdas into the pool, then wait for all to finish.
+    // Scoped block so the pool destructor runs before we print the summary,
+    // guaranteeing all threads have finished and stats are fully updated.
     {
         ThreadPool pool(numThreads);
 
         for (const auto& task : fileTasks) {
-            // Capture by value so each lambda owns its own paths.
+            // Capture src and dst by value so each lambda owns its own copy of the
+            // paths — avoids a dangling reference if the loop variable changes.
             pool.enqueue([src = task.source, dst = task.dest, &stats]() {
                 copyFile(src, dst, stats);
             });
         }
 
-        pool.waitForCompletion(); // FIX 5: this is now actually reached
-    } // pool destructor joins all threads cleanly
+        // Block here until every enqueued task has completed.
+        pool.waitForCompletion();
+    } // pool destructor joins all worker threads cleanly before we continue.
 
     auto endTime  = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
