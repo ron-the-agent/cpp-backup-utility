@@ -1,0 +1,27 @@
+# Compiled files
+*.exe
+*.obj
+*.o
+
+# Build artifacts
+backup
+backup.exe
+
+# Test directories (created during testing)
+test_source/
+test_backup/
+test_backup2/
+
+# IDE files
+.vscode/
+.idea/
+*.sln
+*.vcxproj*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Batch files used for compilation
+compile.bat
+vcvars64.bat
