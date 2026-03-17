@@ -1,8 +1,18 @@
 /*
- * MULTI-THREADED BACKUP UTILITY - Version 1
- * =========================================
+ * MULTI-THREADED BACKUP UTILITY - Version 2 (Fixed)
+ * ==================================================
  * Uses a thread pool to copy multiple files concurrently.
  * Best for: SSDs, network drives, or when copying many small files.
+ *
+ * FIXES from Version 1:
+ *  1. ThreadPool now stores std::function<void()> instead of CopyTask,
+ *     so worker threads can actually execute submitted work.
+ *  2. workerLoop() now calls task() to run the function.
+ *  3. Lock is released before executing the task so other threads
+ *     can pick up work concurrently (was the main bottleneck).
+ *  4. main() now enqueues lambdas into the pool instead of calling
+ *     copyFile() directly on the main thread.
+ *  5. waitForCompletion() is now actually called in main().
  */
 
 #include <iostream>
@@ -22,7 +32,9 @@
 
 namespace fs = std::filesystem;
 
-// Thread-safe statistics structure
+// ─────────────────────────────────────────────
+// Thread-safe statistics
+// ─────────────────────────────────────────────
 struct BackupStats {
     std::atomic<size_t> filesCopied{0};
     std::atomic<size_t> filesSkipped{0};
@@ -30,16 +42,13 @@ struct BackupStats {
     std::atomic<size_t> totalBytes{0};
 };
 
-// Task structure for the thread pool
-struct CopyTask {
-    fs::path source;
-    fs::path dest;
-};
-
-// Thread Pool class for managing worker threads
+// ─────────────────────────────────────────────
+// Thread Pool
+// FIX 1: Queue holds std::function<void()> so any callable can be submitted.
+// ─────────────────────────────────────────────
 class ThreadPool {
 public:
-    ThreadPool(size_t numThreads) : stop(false) {
+    explicit ThreadPool(size_t numThreads) : stop(false), activeTasks(0) {
         for (size_t i = 0; i < numThreads; ++i) {
             workers.emplace_back([this] { workerLoop(); });
         }
@@ -52,11 +61,12 @@ public:
         }
         condition.notify_all();
         for (std::thread& worker : workers) {
-            worker.join();
+            if (worker.joinable()) worker.join();
         }
     }
 
-    void enqueue(CopyTask task) {
+    // Submit any callable (e.g. a lambda) as a task.
+    void enqueue(std::function<void()> task) {
         {
             std::unique_lock<std::mutex> lock(queueMutex);
             tasks.push(std::move(task));
@@ -64,82 +74,95 @@ public:
         condition.notify_one();
     }
 
+    // Block until the queue is empty and all active tasks have finished.
     void waitForCompletion() {
         std::unique_lock<std::mutex> lock(queueMutex);
-        condition.wait(lock, [this] { return tasks.empty() && activeTasks == 0; });
+        done.wait(lock, [this] { return tasks.empty() && activeTasks == 0; });
     }
 
 private:
-    std::vector<std::thread> workers;
-    std::queue<CopyTask> tasks;
-    std::mutex queueMutex;
-    std::condition_variable condition;
-    std::atomic<size_t> activeTasks{0};
-    bool stop;
+    std::vector<std::thread>          workers;
+    std::queue<std::function<void()>> tasks;   // FIX 1: was queue<CopyTask>
+    std::mutex                        queueMutex;
+    std::condition_variable           condition;
+    std::condition_variable           done;     // separate CV for waitForCompletion
+    std::atomic<size_t>               activeTasks;
+    bool                              stop;
 
     void workerLoop() {
         while (true) {
-            CopyTask task;
+            std::function<void()> task;
             {
                 std::unique_lock<std::mutex> lock(queueMutex);
                 condition.wait(lock, [this] { return stop || !tasks.empty(); });
                 if (stop && tasks.empty()) return;
+
                 task = std::move(tasks.front());
                 tasks.pop();
-                activeTasks++;
+                ++activeTasks;
+                // FIX 3: unlock before executing so other threads can
+                //        dequeue their own tasks concurrently.
             }
-            // Task is executed here (will be set via callback)
-            activeTasks--;
-            condition.notify_one();
+
+            task(); // FIX 2: actually run the work
+
+            {
+                std::unique_lock<std::mutex> lock(queueMutex);
+                --activeTasks;
+            }
+            // Wake waitForCompletion() in case we just finished the last task.
+            done.notify_one();
         }
     }
 };
 
+// ─────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────
 std::string formatBytes(size_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB"};
     int unitIndex = 0;
     double size = static_cast<double>(bytes);
     while (size >= 1024.0 && unitIndex < 4) {
         size /= 1024.0;
-        unitIndex++;
+        ++unitIndex;
     }
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2) << size << " " << units[unitIndex];
     return oss.str();
 }
 
-// Thread-safe console output
 std::mutex printMutex;
 void safePrint(const std::string& msg) {
     std::lock_guard<std::mutex> lock(printMutex);
-    std::cout << msg << std::endl;
+    std::cout << msg << "\n";
 }
 
-// Copy a single file (thread-safe)
+// ─────────────────────────────────────────────
+// Core copy logic (unchanged, already thread-safe)
+// ─────────────────────────────────────────────
 bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats) {
     try {
         fs::create_directories(dest.parent_path());
 
         if (fs::exists(dest)) {
             auto sourceTime = fs::last_write_time(source);
-            auto destTime = fs::last_write_time(dest);
+            auto destTime   = fs::last_write_time(dest);
             auto sourceSize = fs::file_size(source);
-            auto destSize = fs::file_size(dest);
+            auto destSize   = fs::file_size(dest);
 
             if (sourceTime <= destTime && sourceSize == destSize) {
-                safePrint("  [SKIP] " + source.filename().string() + " (up to date)");
-                stats.filesSkipped++;
+                safePrint("  [SKIP]  " + source.filename().string() + " (up to date)");
+                ++stats.filesSkipped;
                 return true;
             }
         }
 
-        // Use buffered copy for better performance
         std::ifstream src(source.string(), std::ios::binary);
-        std::ofstream dst(dest.string(), std::ios::binary);
+        std::ofstream dst(dest.string(),   std::ios::binary);
 
-        // 1MB buffer for faster copying
-        const size_t bufferSize = 1024 * 1024;
-        std::vector<char> buffer(bufferSize);
+        const size_t       bufferSize = 1024 * 1024; // 1 MB
+        std::vector<char>  buffer(bufferSize);
 
         while (src.good()) {
             src.read(buffer.data(), bufferSize);
@@ -151,24 +174,28 @@ bool copyFile(const fs::path& source, const fs::path& dest, BackupStats& stats) 
 
         auto fileSize = fs::file_size(source);
         stats.totalBytes += fileSize;
-        stats.filesCopied++;
+        ++stats.filesCopied;
 
-        safePrint("  [COPY] " + source.filename().string() + " (" + formatBytes(fileSize) + ")");
+        safePrint("  [COPY]  " + source.filename().string() +
+                  " (" + formatBytes(fileSize) + ")");
         return true;
 
     } catch (const std::exception& e) {
-        safePrint("  [ERROR] Failed to copy " + source.string() + ": " + e.what());
-        stats.errors++;
+        safePrint("  [ERROR] " + source.string() + " → " + e.what());
+        ++stats.errors;
         return false;
     }
 }
 
+// ─────────────────────────────────────────────
+// CLI
+// ─────────────────────────────────────────────
 void printUsage(const char* programName) {
-    std::cout << "Usage: " << programName << " <source> <destination> [options]" << std::endl;
-    std::cout << "\nOptions:" << std::endl;
-    std::cout << "  -t, --threads N    Number of threads (default: hardware concurrency)" << std::endl;
-    std::cout << "  -s, --shallow      Copy only files in root directory" << std::endl;
-    std::cout << "  -h, --help         Show this help message" << std::endl;
+    std::cout << "Usage: " << programName << " <source> <destination> [options]\n"
+              << "\nOptions:\n"
+              << "  -t, --threads N    Number of threads (default: hardware concurrency)\n"
+              << "  -s, --shallow      Copy only files in root directory\n"
+              << "  -h, --help         Show this help message\n";
 }
 
 int main(int argc, char* argv[]) {
@@ -178,18 +205,15 @@ int main(int argc, char* argv[]) {
     }
 
     fs::path sourcePath = argv[1];
-    fs::path destPath = argv[2];
-    bool recursive = true;
-    size_t numThreads = std::thread::hardware_concurrency();
-    if (numThreads == 0) numThreads = 4; // Fallback
+    fs::path destPath   = argv[2];
+    bool     recursive  = true;
+    size_t   numThreads = std::thread::hardware_concurrency();
+    if (numThreads == 0) numThreads = 4;
 
-    // Parse options
-    for (int i = 3; i < argc; i++) {
+    for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
-        if (arg == "-t" || arg == "--threads") {
-            if (i + 1 < argc) {
-                numThreads = std::stoul(argv[++i]);
-            }
+        if ((arg == "-t" || arg == "--threads") && i + 1 < argc) {
+            numThreads = std::stoul(argv[++i]);
         } else if (arg == "-s" || arg == "--shallow") {
             recursive = false;
         } else if (arg == "-h" || arg == "--help") {
@@ -199,68 +223,73 @@ int main(int argc, char* argv[]) {
     }
 
     if (!fs::exists(sourcePath)) {
-        std::cerr << "Error: Source path does not exist: " << sourcePath << std::endl;
+        std::cerr << "Error: Source path does not exist: " << sourcePath << "\n";
         return 1;
     }
 
-    if (!fs::exists(destPath)) {
-        std::cout << "Creating destination directory: " << destPath << std::endl;
-        fs::create_directories(destPath);
-    }
+    fs::create_directories(destPath);
 
     BackupStats stats;
     auto startTime = std::chrono::steady_clock::now();
 
-    std::cout << "Using " << numThreads << " threads" << std::endl;
-    ThreadPool pool(numThreads);
+    std::cout << "Using " << numThreads << " threads\n";
 
-    // Collect all files first
-    std::vector<CopyTask> tasks;
+    // Collect file pairs
+    struct CopyTask { fs::path source, dest; };
+    std::vector<CopyTask> fileTasks;
 
     if (fs::is_directory(sourcePath)) {
-        std::cout << "\nScanning directory..." << std::endl;
-
+        std::cout << "\nScanning directory...\n";
         if (recursive) {
             for (const auto& entry : fs::recursive_directory_iterator(sourcePath)) {
                 if (fs::is_regular_file(entry)) {
-                    fs::path relativePath = fs::relative(entry.path(), sourcePath);
-                    tasks.push_back({entry.path(), destPath / relativePath});
+                    fs::path rel = fs::relative(entry.path(), sourcePath);
+                    fileTasks.push_back({entry.path(), destPath / rel});
                 }
             }
         } else {
             for (const auto& entry : fs::directory_iterator(sourcePath)) {
                 if (fs::is_regular_file(entry)) {
-                    tasks.push_back({entry.path(), destPath / entry.path().filename()});
+                    fileTasks.push_back({entry.path(),
+                                         destPath / entry.path().filename()});
                 }
             }
         }
     } else {
-        tasks.push_back({sourcePath, destPath / sourcePath.filename()});
+        fileTasks.push_back({sourcePath, destPath / sourcePath.filename()});
     }
 
-    std::cout << "Found " << tasks.size() << " files to process" << std::endl;
-    std::cout << std::string(50, '-') << std::endl;
+    std::cout << "Found " << fileTasks.size() << " files to process\n"
+              << std::string(50, '-') << "\n";
 
-    // Submit all tasks to thread pool
-    for (auto& task : tasks) {
-        // Note: In a real implementation, we'd bind the copy function here
-        // For simplicity, we'll process sequentially but this shows the structure
-        copyFile(task.source, task.dest, stats);
-    }
+    // FIX 4 & 5: enqueue lambdas into the pool, then wait for all to finish.
+    {
+        ThreadPool pool(numThreads);
 
-    auto endTime = std::chrono::steady_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::seconds>(endTime - startTime);
+        for (const auto& task : fileTasks) {
+            // Capture by value so each lambda owns its own paths.
+            pool.enqueue([src = task.source, dst = task.dest, &stats]() {
+                copyFile(src, dst, stats);
+            });
+        }
 
-    std::cout << "\n" << std::string(50, '=') << std::endl;
-    std::cout << "BACKUP SUMMARY (Threaded)" << std::endl;
-    std::cout << std::string(50, '=') << std::endl;
-    std::cout << "Files copied:   " << stats.filesCopied << std::endl;
-    std::cout << "Files skipped:  " << stats.filesSkipped << std::endl;
-    std::cout << "Errors:         " << stats.errors << std::endl;
-    std::cout << "Total size:     " << formatBytes(stats.totalBytes) << std::endl;
-    std::cout << "Time elapsed:   " << duration.count() << " seconds" << std::endl;
-    std::cout << "Threads used:   " << numThreads << std::endl;
-    std::cout << std::string(50, '=') << std::endl;
+        pool.waitForCompletion(); // FIX 5: this is now actually reached
+    } // pool destructor joins all threads cleanly
+
+    auto endTime  = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        endTime - startTime);
+
+    std::cout << "\n" << std::string(50, '=') << "\n"
+              << "BACKUP SUMMARY (Threaded)\n"
+              << std::string(50, '=') << "\n"
+              << "Files copied:   " << stats.filesCopied  << "\n"
+              << "Files skipped:  " << stats.filesSkipped << "\n"
+              << "Errors:         " << stats.errors       << "\n"
+              << "Total size:     " << formatBytes(stats.totalBytes) << "\n"
+              << "Time elapsed:   " << duration.count() << " ms\n"
+              << "Threads used:   " << numThreads << "\n"
+              << std::string(50, '=') << "\n";
 
     return (stats.errors > 0) ? 1 : 0;
 }
