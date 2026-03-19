@@ -21,7 +21,8 @@
 #include <atomic>
 #include <algorithm>
 #include <execution>
-#include <math>
+#include <cmath>
+#include <mutex>
 
 namespace fs = std::filesystem;
 using namespace std::chrono;

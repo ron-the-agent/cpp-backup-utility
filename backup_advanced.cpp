@@ -31,11 +31,13 @@
 // Platform-specific includes for memory mapping
 #ifdef _WIN32
     #include <windows.h>
+    #include <cstring>
 #else
     #include <sys/mman.h>
     #include <sys/stat.h>
-    #include ?cntl.h>
+    #include <fcntl.h>
     #include <unistd.h>
+    #include <cstring>
 #endif
 
 namespace fs = std::filesystem;
